@@ -1,0 +1,957 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+-- ==========================================
+-- CLEAN TOGGLE / SINGLETON (NO LEFT-BEHIND BUGS)
+-- ==========================================
+local REGISTRY_KEY = "__GTA_SHOULDER_FREECAM_GUI_V3_" .. tostring(player.UserId)
+local rootEnv = (getgenv and getgenv()) or _G
+
+if rootEnv[REGISTRY_KEY] then
+	local prev = rootEnv[REGISTRY_KEY]
+	if prev.stop then
+		pcall(prev.stop)
+	end
+	rootEnv[REGISTRY_KEY] = nil
+
+	local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum.AutoRotate = true
+		hum.WalkSpeed = 16
+		hum.JumpPower = 50
+		camera.CameraSubject = hum
+	end
+	camera.CameraType = Enum.CameraType.Custom
+	if not UserInputService.TouchEnabled then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	end
+	return
+end
+
+-- ==========================================
+-- CONFIGURATION
+-- ==========================================
+local CONFIG = {
+	DefaultShoulderX = 2.65,
+	MinShoulderX = -4.5,
+	MaxShoulderX = 4.5,
+
+	DefaultShoulderY = 1.65,
+	MinShoulderY = -3.0,
+	MaxShoulderY = 5.5,
+
+	PivotHeightOffset = 1.45,
+	LookAheadDistance = 38,
+
+	DefaultDistance = 10.5,
+	MinDistance = 4.5,
+	MaxDistance = 20,
+	ZoomStep = 1.6,
+
+	CameraLerpSpeed = 13,
+	RotationLerpSpeed = 16,
+
+	MouseSensitivity = 0.0033,
+	TouchSensitivity = 0.0052,
+	OrbitMinScreenXRatio = 0.42,
+
+	MinPitch = math.rad(-55),
+	MaxPitch = math.rad(65),
+
+	WalkBobFreq = 9.5,
+	RunBobFreq = 14.5,
+	WalkShakeAmp = 0.045,
+	RunShakeAmp = 0.11,
+	JumpImpulseShake = 0.22,
+	LandImpulseShake = 0.34,
+	ShakeDecaySpeed = 10,
+
+	FreecamKey = Enum.KeyCode.F,
+	FreecamSpeed = 34,
+	MinFreecamSpeed = 5,
+	MaxFreecamSpeed = 150,
+	FreecamFastMultiplier = 2.2,
+	FreecamLerpSpeed = 10,
+}
+
+local RENDER_STEP_NAME = "GtaShoulderFreecamGuiStep_" .. tostring(player.UserId) .. "_" .. tostring(os.clock())
+
+-- ==========================================
+-- LIVE TUNABLE STATE (MIRRORING CONFIG)
+-- ==========================================
+local destroyed = false
+local cameraEnabled = true
+local isFreecam = false
+
+local shoulderX = CONFIG.DefaultShoulderX
+local shoulderY = CONFIG.DefaultShoulderY
+local pivotHeightOffset = CONFIG.PivotHeightOffset
+local lookAheadDistance = CONFIG.LookAheadDistance
+
+local yaw = 0
+local pitch = math.rad(6)
+local targetDistance = CONFIG.DefaultDistance
+local currentDistance = CONFIG.DefaultDistance
+
+local cameraLerpSpeed = CONFIG.CameraLerpSpeed
+local rotationLerpSpeed = CONFIG.RotationLerpSpeed
+local mouseSensitivity = CONFIG.MouseSensitivity
+local touchSensitivity = CONFIG.TouchSensitivity
+
+local walkShakeAmp = CONFIG.WalkShakeAmp
+local runShakeAmp = CONFIG.RunShakeAmp
+local jumpImpulseShake = CONFIG.JumpImpulseShake
+local landImpulseShake = CONFIG.LandImpulseShake
+
+local freecamSpeed = CONFIG.FreecamSpeed
+local freecamFastMultiplier = CONFIG.FreecamFastMultiplier
+
+local currentCamPos = camera.CFrame.Position
+local currentYaw = yaw
+local currentPitch = pitch
+
+local bobTimer = 0
+local impulseShakeOffset = Vector3.zero
+local prevHumanoidState: Enum.HumanoidStateType? = nil
+
+local freecamPos = Vector3.zero
+local freecamVelocity = Vector3.zero
+local mobileMoveVec = Vector2.zero
+local mobileVerticalMove = 0
+
+local connections: { RBXScriptConnection } = {}
+local guiInstances: { Instance } = {}
+local sliderUpdaters: { () -> () } = {}
+
+local panelFrame: Frame? = nil
+local reopenBtn: TextButton? = nil
+local camToggleBtn: TextButton? = nil
+local freecamBtn: TextButton? = nil
+local mobileControlsFrame: Frame? = nil
+
+local isDraggingGui = false
+local dragStartMousePos = Vector2.zero
+local dragStartPanelPos = UDim2.new()
+local activeSliderId: string? = nil
+
+local function trackConn(conn: RBXScriptConnection)
+	table.insert(connections, conn)
+	return conn
+end
+
+local function getRootPart(): BasePart?
+	local char = player.Character
+	if not char then return nil end
+	return char:FindFirstChild("HumanoidRootPart") :: BasePart?
+end
+
+local function getHumanoid(): Humanoid?
+	local char = player.Character
+	if not char then return nil end
+	return char:FindFirstChildOfClass("Humanoid")
+end
+
+local function isPointInsideGui(pos: Vector2): boolean
+	if panelFrame and panelFrame.Visible then
+		local p = panelFrame.AbsolutePosition
+		local s = panelFrame.AbsoluteSize
+		if pos.X >= p.X and pos.X <= p.X + s.X and pos.Y >= p.Y and pos.Y <= p.Y + s.Y then
+			return true
+		end
+	end
+	if reopenBtn and reopenBtn.Visible then
+		local p = reopenBtn.AbsolutePosition
+		local s = reopenBtn.AbsoluteSize
+		if pos.X >= p.X and pos.X <= p.X + s.X and pos.Y >= p.Y and pos.Y <= p.Y + s.Y then
+			return true
+		end
+	end
+	return false
+end
+
+local function refreshAllSliders()
+	for _, fn in ipairs(sliderUpdaters) do
+		pcall(fn)
+	end
+end
+
+local function resetAllDefaults()
+	shoulderX = CONFIG.DefaultShoulderX
+	shoulderY = CONFIG.DefaultShoulderY
+	pivotHeightOffset = CONFIG.PivotHeightOffset
+	lookAheadDistance = CONFIG.LookAheadDistance
+	targetDistance = CONFIG.DefaultDistance
+	cameraLerpSpeed = CONFIG.CameraLerpSpeed
+	rotationLerpSpeed = CONFIG.RotationLerpSpeed
+	mouseSensitivity = CONFIG.MouseSensitivity
+	touchSensitivity = CONFIG.TouchSensitivity
+	walkShakeAmp = CONFIG.WalkShakeAmp
+	runShakeAmp = CONFIG.RunShakeAmp
+	jumpImpulseShake = CONFIG.JumpImpulseShake
+	landImpulseShake = CONFIG.LandImpulseShake
+	freecamSpeed = CONFIG.FreecamSpeed
+	freecamFastMultiplier = CONFIG.FreecamFastMultiplier
+	refreshAllSliders()
+end
+
+local function setFreecam(enabled: boolean)
+	if destroyed then return end
+	if enabled and not cameraEnabled then return end
+
+	isFreecam = enabled
+	local humanoid = getHumanoid()
+
+	if isFreecam then
+		freecamPos = camera.CFrame.Position
+		freecamVelocity = Vector3.zero
+		if humanoid then
+			humanoid.WalkSpeed = 0
+			humanoid.JumpPower = 0
+		end
+		if freecamBtn then
+			freecamBtn.Text = "Freecam: ON"
+			freecamBtn.BackgroundColor3 = Color3.fromRGB(45, 130, 90)
+		end
+		if mobileControlsFrame and UserInputService.TouchEnabled then
+			mobileControlsFrame.Visible = true
+		end
+	else
+		mobileMoveVec = Vector2.zero
+		mobileVerticalMove = 0
+		if humanoid and cameraEnabled then
+			humanoid.WalkSpeed = 16
+			humanoid.JumpPower = 50
+			humanoid.AutoRotate = true
+		end
+		local root = getRootPart()
+		if root and cameraEnabled then
+			currentCamPos = root.Position + Vector3.new(0, shoulderY, targetDistance)
+		end
+		if freecamBtn then
+			freecamBtn.Text = "Freecam: OFF"
+			freecamBtn.BackgroundColor3 = Color3.fromRGB(38, 38, 48)
+		end
+		if mobileControlsFrame then
+			mobileControlsFrame.Visible = false
+		end
+	end
+end
+
+local function setCameraEnabled(enabled: boolean)
+	if destroyed then return end
+	cameraEnabled = enabled
+
+	if not cameraEnabled then
+		if isFreecam then
+			setFreecam(false)
+		end
+		local hum = getHumanoid()
+		if hum then
+			hum.AutoRotate = true
+			hum.WalkSpeed = 16
+			hum.JumpPower = 50
+			camera.CameraSubject = hum
+		end
+		camera.CameraType = Enum.CameraType.Custom
+		if not UserInputService.TouchEnabled then
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		end
+		if camToggleBtn then
+			camToggleBtn.Text = "Camera: OFF"
+			camToggleBtn.BackgroundColor3 = Color3.fromRGB(130, 45, 55)
+		end
+	else
+		local hum = getHumanoid()
+		if hum then
+			hum.AutoRotate = true
+			hum.WalkSpeed = 16
+			hum.JumpPower = 50
+			prevHumanoidState = hum:GetState()
+		end
+		currentCamPos = camera.CFrame.Position
+		camera.CameraType = Enum.CameraType.Scriptable
+		if not UserInputService.TouchEnabled then
+			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+		end
+		if camToggleBtn then
+			camToggleBtn.Text = "Camera: ON"
+			camToggleBtn.BackgroundColor3 = Color3.fromRGB(45, 110, 160)
+		end
+	end
+end
+
+local function createConfigSlider(
+	parent: Instance,
+	id: string,
+	labelText: string,
+	minVal: number,
+	maxVal: number,
+	formatStr: string,
+	getter: () -> number,
+	setter: (number) -> (),
+	fixedPos: UDim2?
+)
+	local row = Instance.new("Frame")
+	row.Name = id .. "Row"
+	row.Size = fixedPos and UDim2.new(1, -24, 0, 38) or UDim2.new(1, -6, 0, 38)
+	if fixedPos then
+		row.Position = fixedPos
+	end
+	row.BackgroundTransparency = 1
+	row.Parent = parent
+
+	local header = Instance.new("TextLabel")
+	header.Name = "Label"
+	header.Size = UDim2.new(1, -64, 0, 16)
+	header.Position = UDim2.fromOffset(0, 0)
+	header.BackgroundTransparency = 1
+	header.Text = labelText
+	header.TextXAlignment = Enum.TextXAlignment.Left
+	header.TextColor3 = Color3.fromRGB(195, 200, 210)
+	header.Font = Enum.Font.GothamSemibold
+	header.TextSize = 11
+	header.Parent = row
+
+	local valLabel = Instance.new("TextLabel")
+	valLabel.Name = "Value"
+	valLabel.Size = UDim2.fromOffset(60, 16)
+	valLabel.Position = UDim2.new(1, -60, 0, 0)
+	valLabel.BackgroundTransparency = 1
+	valLabel.Text = string.format(formatStr, getter())
+	valLabel.TextXAlignment = Enum.TextXAlignment.Right
+	valLabel.TextColor3 = Color3.fromRGB(120, 200, 255)
+	valLabel.Font = Enum.Font.GothamBold
+	valLabel.TextSize = 11
+	valLabel.Parent = row
+
+	local track = Instance.new("Frame")
+	track.Name = "Track"
+	track.Size = UDim2.new(1, 0, 0, 14)
+	track.Position = UDim2.fromOffset(0, 20)
+	track.BackgroundColor3 = Color3.fromRGB(40, 40, 52)
+	track.BorderSizePixel = 0
+	track.Active = true
+	track.Parent = row
+
+	local trackCorner = Instance.new("UICorner")
+	trackCorner.CornerRadius = UDim.new(1, 0)
+	trackCorner.Parent = track
+
+	local fill = Instance.new("Frame")
+	fill.Name = "Fill"
+	fill.Size = UDim2.fromScale(0.5, 1)
+	fill.BackgroundColor3 = Color3.fromRGB(65, 145, 225)
+	fill.BorderSizePixel = 0
+	fill.Parent = track
+
+	local fillCorner = Instance.new("UICorner")
+	fillCorner.CornerRadius = UDim.new(1, 0)
+	fillCorner.Parent = fill
+
+	local knob = Instance.new("Frame")
+	knob.Name = "Knob"
+	knob.Size = UDim2.fromOffset(16, 16)
+	knob.AnchorPoint = Vector2.new(0.5, 0.5)
+	knob.Position = UDim2.new(0.5, 0, 0.5, 0)
+	knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	knob.BorderSizePixel = 0
+	knob.Parent = track
+
+	local knobCorner = Instance.new("UICorner")
+	knobCorner.CornerRadius = UDim.new(1, 0)
+	knobCorner.Parent = knob
+
+	local function syncVisuals()
+		local span = math.max(1e-6, maxVal - minVal)
+		local v = getter()
+		local alpha = math.clamp((v - minVal) / span, 0, 1)
+		fill.Size = UDim2.fromScale(alpha, 1)
+		knob.Position = UDim2.new(alpha, 0, 0.5, 0)
+		valLabel.Text = string.format(formatStr, v)
+	end
+
+	local function applyFromScreenX(screenX: number)
+		local absPos = track.AbsolutePosition.X
+		local absSize = math.max(1, track.AbsoluteSize.X)
+		local alpha = math.clamp((screenX - absPos) / absSize, 0, 1)
+		setter(minVal + alpha * (maxVal - minVal))
+		refreshAllSliders()
+	end
+
+	syncVisuals()
+	table.insert(sliderUpdaters, syncVisuals)
+
+	trackConn(track.InputBegan:Connect(function(input)
+		if destroyed then return end
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			activeSliderId = id
+			applyFromScreenX(input.Position.X)
+		end
+	end))
+
+	trackConn(UserInputService.InputChanged:Connect(function(input)
+		if destroyed or activeSliderId ~= id then return end
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			applyFromScreenX(input.Position.X)
+		end
+	end))
+
+	trackConn(UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			if activeSliderId == id then
+				activeSliderId = nil
+			end
+		end
+	end))
+end
+
+local function createGui()
+	table.clear(sliderUpdaters)
+
+	local playerGui = player:WaitForChild("PlayerGui")
+	local old = playerGui:FindFirstChild("ShoulderFreecamGui")
+	if old then
+		old:Destroy()
+	end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "ShoulderFreecamGui"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.Parent = playerGui
+	table.insert(guiInstances, gui)
+
+	local panel = Instance.new("Frame")
+	panel.Name = "CameraPanel"
+	panel.Size = UDim2.fromOffset(236, 456)
+	panel.Position = UDim2.new(1, -252, 0, 20)
+	panel.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+	panel.BackgroundTransparency = 0.15
+	panel.BorderSizePixel = 0
+	panel.Active = true
+	panel.Parent = gui
+	panelFrame = panel
+
+	local panelCorner = Instance.new("UICorner")
+	panelCorner.CornerRadius = UDim.new(0, 12)
+	panelCorner.Parent = panel
+
+	local panelStroke = Instance.new("UIStroke")
+	panelStroke.Color = Color3.fromRGB(70, 70, 85)
+	panelStroke.Thickness = 1
+	panelStroke.Parent = panel
+
+	local dragHandle = Instance.new("TextButton")
+	dragHandle.Name = "DragHandle"
+	dragHandle.Size = UDim2.new(1, -36, 0, 32)
+	dragHandle.Position = UDim2.fromOffset(0, 0)
+	dragHandle.BackgroundTransparency = 1
+	dragHandle.Text = "  GTA CAMERA CONFIG"
+	dragHandle.TextXAlignment = Enum.TextXAlignment.Left
+	dragHandle.TextColor3 = Color3.fromRGB(215, 220, 230)
+	dragHandle.Font = Enum.Font.GothamBold
+	dragHandle.TextSize = 12
+	dragHandle.AutoButtonColor = false
+	dragHandle.Parent = panel
+
+	trackConn(dragHandle.InputBegan:Connect(function(input)
+		if destroyed then return end
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			isDraggingGui = true
+			dragStartMousePos = Vector2.new(input.Position.X, input.Position.Y)
+			dragStartPanelPos = panel.Position
+		end
+	end))
+
+	local closeBtn = Instance.new("TextButton")
+	closeBtn.Name = "CloseButton"
+	closeBtn.Size = UDim2.fromOffset(26, 26)
+	closeBtn.Position = UDim2.new(1, -32, 0, 5)
+	closeBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+	closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	closeBtn.Font = Enum.Font.GothamBold
+	closeBtn.TextSize = 14
+	closeBtn.Text = "X"
+	closeBtn.Parent = panel
+
+	local closeCorner = Instance.new("UICorner")
+	closeCorner.CornerRadius = UDim.new(0, 7)
+	closeCorner.Parent = closeBtn
+
+	local cBtn = Instance.new("TextButton")
+	cBtn.Name = "CameraToggle"
+	cBtn.Size = UDim2.new(1, -24, 0, 30)
+	cBtn.Position = UDim2.fromOffset(12, 36)
+	cBtn.BackgroundColor3 = Color3.fromRGB(45, 110, 160)
+	cBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	cBtn.Font = Enum.Font.GothamBold
+	cBtn.TextSize = 12
+	cBtn.Text = "Camera: ON"
+	cBtn.Parent = panel
+	camToggleBtn = cBtn
+
+	local cCorner = Instance.new("UICorner")
+	cCorner.CornerRadius = UDim.new(0, 8)
+	cCorner.Parent = cBtn
+
+	local fBtn = Instance.new("TextButton")
+	fBtn.Name = "FreecamToggle"
+	fBtn.Size = UDim2.new(1, -24, 0, 30)
+	fBtn.Position = UDim2.fromOffset(12, 70)
+	fBtn.BackgroundColor3 = Color3.fromRGB(38, 38, 48)
+	fBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	fBtn.Font = Enum.Font.GothamBold
+	fBtn.TextSize = 12
+	fBtn.Text = "Freecam: OFF"
+	fBtn.Parent = panel
+	freecamBtn = fBtn
+
+	local fCorner = Instance.new("UICorner")
+	fCorner.CornerRadius = UDim.new(0, 8)
+	fCorner.Parent = fBtn
+
+	createConfigSlider(
+		panel,
+		"QuickFreecamSpeed",
+		"Freecam Speed",
+		CONFIG.MinFreecamSpeed,
+		CONFIG.MaxFreecamSpeed,
+		"%.0f",
+		function() return freecamSpeed end,
+		function(v) freecamSpeed = v end,
+		UDim2.fromOffset(12, 104)
+	)
+
+	local resetBtn = Instance.new("TextButton")
+	resetBtn.Name = "ResetConfigButton"
+	resetBtn.Size = UDim2.new(1, -24, 0, 26)
+	resetBtn.Position = UDim2.fromOffset(12, 146)
+	resetBtn.BackgroundColor3 = Color3.fromRGB(55, 55, 70)
+	resetBtn.TextColor3 = Color3.fromRGB(235, 240, 250)
+	resetBtn.Font = Enum.Font.GothamBold
+	resetBtn.TextSize = 11
+	resetBtn.Text = "Reset All Defaults"
+	resetBtn.Parent = panel
+
+	local resetCorner = Instance.new("UICorner")
+	resetCorner.CornerRadius = UDim.new(0, 7)
+	resetCorner.Parent = resetBtn
+
+	local sf = Instance.new("ScrollingFrame")
+	sf.Name = "ConfigScroller"
+	sf.Size = UDim2.new(1, -20, 1, -182)
+	sf.Position = UDim2.fromOffset(12, 176)
+	sf.BackgroundTransparency = 1
+	sf.BorderSizePixel = 0
+	sf.ScrollBarThickness = 4
+	sf.ScrollBarImageColor3 = Color3.fromRGB(110, 120, 140)
+	sf.CanvasSize = UDim2.fromOffset(0, 0)
+	sf.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	sf.Parent = panel
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 6)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = sf
+
+	createConfigSlider(sf, "ShoulderX", "Shoulder X (Left/Right)", CONFIG.MinShoulderX, CONFIG.MaxShoulderX, "%.2f",
+		function() return shoulderX end, function(v) shoulderX = v end, nil)
+	createConfigSlider(sf, "ShoulderY", "Shoulder Y (Up/Down)", CONFIG.MinShoulderY, CONFIG.MaxShoulderY, "%.2f",
+		function() return shoulderY end, function(v) shoulderY = v end, nil)
+	createConfigSlider(sf, "PivotHeight", "Pivot Height Offset", 0, 5, "%.2f",
+		function() return pivotHeightOffset end, function(v) pivotHeightOffset = v end, nil)
+	createConfigSlider(sf, "LookAhead", "Look Ahead Distance", 5, 100, "%.0f",
+		function() return lookAheadDistance end, function(v) lookAheadDistance = v end, nil)
+	createConfigSlider(sf, "Distance", "Camera Distance", CONFIG.MinDistance, CONFIG.MaxDistance, "%.1f",
+		function() return targetDistance end, function(v) targetDistance = v end, nil)
+
+	createConfigSlider(sf, "CamLerp", "Camera Lerp Speed", 1, 30, "%.1f",
+		function() return cameraLerpSpeed end, function(v) cameraLerpSpeed = v end, nil)
+	createConfigSlider(sf, "RotLerp", "Rotation Lerp Speed", 1, 35, "%.1f",
+		function() return rotationLerpSpeed end, function(v) rotationLerpSpeed = v end, nil)
+	createConfigSlider(sf, "MouseSens", "Mouse Sensitivity", 0.0005, 0.015, "%.4f",
+		function() return mouseSensitivity end, function(v) mouseSensitivity = v end, nil)
+	createConfigSlider(sf, "TouchSens", "Touch Sensitivity", 0.001, 0.02, "%.4f",
+		function() return touchSensitivity end, function(v) touchSensitivity = v end, nil)
+
+	createConfigSlider(sf, "WalkShake", "Walk Bob Amplitude", 0, 0.3, "%.3f",
+		function() return walkShakeAmp end, function(v) walkShakeAmp = v end, nil)
+	createConfigSlider(sf, "RunShake", "Run Bob Amplitude", 0, 0.5, "%.3f",
+		function() return runShakeAmp end, function(v) runShakeAmp = v end, nil)
+	createConfigSlider(sf, "JumpShake", "Jump Impulse Shake", 0, 1.0, "%.2f",
+		function() return jumpImpulseShake end, function(v) jumpImpulseShake = v end, nil)
+	createConfigSlider(sf, "LandShake", "Land Impulse Shake", 0, 1.2, "%.2f",
+		function() return landImpulseShake end, function(v) landImpulseShake = v end, nil)
+
+	createConfigSlider(sf, "FreecamSpeed", "Freecam Speed", CONFIG.MinFreecamSpeed, CONFIG.MaxFreecamSpeed, "%.0f",
+		function() return freecamSpeed end, function(v) freecamSpeed = v end, nil)
+	createConfigSlider(sf, "FreecamFast", "Freecam Sprint Mult", 1, 6, "%.1f",
+		function() return freecamFastMultiplier end, function(v) freecamFastMultiplier = v end, nil)
+
+	local rBtn = Instance.new("TextButton")
+	rBtn.Name = "ReopenButton"
+	rBtn.Size = UDim2.fromOffset(48, 34)
+	rBtn.Position = UDim2.new(1, -64, 0, 20)
+	rBtn.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
+	rBtn.BackgroundTransparency = 0.15
+	rBtn.TextColor3 = Color3.fromRGB(235, 240, 250)
+	rBtn.Font = Enum.Font.GothamBold
+	rBtn.TextSize = 12
+	rBtn.Text = "CAM"
+	rBtn.Visible = false
+	rBtn.Parent = gui
+	reopenBtn = rBtn
+
+	local rCorner = Instance.new("UICorner")
+	rCorner.CornerRadius = UDim.new(0, 8)
+	rCorner.Parent = rBtn
+
+	local rStroke = Instance.new("UIStroke")
+	rStroke.Color = Color3.fromRGB(80, 80, 95)
+	rStroke.Thickness = 1
+	rStroke.Parent = rBtn
+
+	trackConn(closeBtn.MouseButton1Click:Connect(function()
+		if destroyed then return end
+		isDraggingGui = false
+		activeSliderId = nil
+		panel.Visible = false
+		rBtn.Visible = true
+	end))
+
+	trackConn(rBtn.MouseButton1Click:Connect(function()
+		if destroyed then return end
+		rBtn.Visible = false
+		panel.Visible = true
+	end))
+
+	trackConn(cBtn.MouseButton1Click:Connect(function()
+		if destroyed then return end
+		setCameraEnabled(not cameraEnabled)
+	end))
+
+	trackConn(fBtn.MouseButton1Click:Connect(function()
+		if destroyed then return end
+		if not cameraEnabled then
+			setCameraEnabled(true)
+		end
+		setFreecam(not isFreecam)
+	end))
+
+	trackConn(resetBtn.MouseButton1Click:Connect(function()
+		if destroyed then return end
+		resetAllDefaults()
+	end))
+
+	local mFrame = Instance.new("Frame")
+	mFrame.Name = "MobileFreecamControls"
+	mFrame.Size = UDim2.fromOffset(170, 120)
+	mFrame.Position = UDim2.new(0, 24, 1, -155)
+	mFrame.BackgroundTransparency = 1
+	mFrame.Visible = false
+	mFrame.Parent = gui
+	mobileControlsFrame = mFrame
+
+	local function makePadBtn(name: string, text: string, pos: UDim2, onHold: (boolean) -> ())
+		local b = Instance.new("TextButton")
+		b.Name = name
+		b.Size = UDim2.fromOffset(48, 36)
+		b.Position = pos
+		b.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+		b.BackgroundTransparency = 0.25
+		b.TextColor3 = Color3.fromRGB(255, 255, 255)
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 12
+		b.Text = text
+		b.Parent = mFrame
+
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(0, 8)
+		c.Parent = b
+
+		trackConn(b.InputBegan:Connect(function(input)
+			if destroyed then return end
+			if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+				onHold(true)
+			end
+		end))
+		trackConn(b.InputEnded:Connect(function(input)
+			if destroyed then return end
+			if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+				onHold(false)
+			end
+		end))
+	end
+
+	makePadBtn("Fwd", "W", UDim2.fromOffset(56, 0), function(h) mobileMoveVec = Vector2.new(mobileMoveVec.X, h and 1 or 0) end)
+	makePadBtn("Back", "S", UDim2.fromOffset(56, 80), function(h) mobileMoveVec = Vector2.new(mobileMoveVec.X, h and -1 or 0) end)
+	makePadBtn("Left", "A", UDim2.fromOffset(4, 40), function(h) mobileMoveVec = Vector2.new(h and -1 or 0, mobileMoveVec.Y) end)
+	makePadBtn("Right", "D", UDim2.fromOffset(108, 40), function(h) mobileMoveVec = Vector2.new(h and 1 or 0, mobileMoveVec.Y) end)
+	makePadBtn("Up", "UP", UDim2.fromOffset(178, 18), function(h) mobileVerticalMove = h and 1 or 0 end)
+	makePadBtn("Down", "DN", UDim2.fromOffset(178, 62), function(h) mobileVerticalMove = h and -1 or 0 end)
+end
+
+local function updateCamera(dt: number)
+	if destroyed or not cameraEnabled then return end
+	dt = math.min(dt, 0.05)
+
+	local root = getRootPart()
+	local humanoid = getHumanoid()
+
+	camera.CameraType = Enum.CameraType.Scriptable
+
+	if not UserInputService.TouchEnabled and not isDraggingGui and not activeSliderId then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+	end
+
+	currentYaw += (yaw - currentYaw) * math.min(1, rotationLerpSpeed * dt)
+	currentPitch += (pitch - currentPitch) * math.min(1, rotationLerpSpeed * dt)
+	currentDistance += (targetDistance - currentDistance) * math.min(1, cameraLerpSpeed * dt)
+
+	local rotCFrame = CFrame.fromOrientation(currentPitch, currentYaw, 0)
+	local forward = rotCFrame.LookVector
+	local right = rotCFrame.RightVector
+
+	if isFreecam then
+		local moveInput = Vector3.zero
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveInput += forward end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveInput -= forward end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveInput += right end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveInput -= right end
+		if UserInputService:IsKeyDown(Enum.KeyCode.E) or UserInputService:IsKeyDown(Enum.KeyCode.Space) then moveInput += Vector3.yAxis end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Q) or UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then moveInput -= Vector3.yAxis end
+
+		if mobileMoveVec.Magnitude > 0.01 then
+			moveInput += (forward * mobileMoveVec.Y) + (right * mobileMoveVec.X)
+		end
+		if math.abs(mobileVerticalMove) > 0.01 then
+			moveInput += Vector3.yAxis * mobileVerticalMove
+		end
+
+		if moveInput.Magnitude > 1 then
+			moveInput = moveInput.Unit
+		end
+
+		local speed = freecamSpeed
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+			speed *= freecamFastMultiplier
+		end
+
+		local targetVel = moveInput * speed
+		freecamVelocity += (targetVel - freecamVelocity) * math.min(1, CONFIG.FreecamLerpSpeed * dt)
+		freecamPos += freecamVelocity * dt
+
+		camera.CFrame = CFrame.lookAt(freecamPos, freecamPos + forward)
+		return
+	end
+
+	if not root then return end
+
+	if humanoid then
+		humanoid.AutoRotate = true
+
+		local state = humanoid:GetState()
+		if prevHumanoidState and state ~= prevHumanoidState then
+			if state == Enum.HumanoidStateType.Jumping then
+				impulseShakeOffset += Vector3.new(0, -jumpImpulseShake, 0)
+			elseif prevHumanoidState == Enum.HumanoidStateType.Freefall and state == Enum.HumanoidStateType.Landed then
+				impulseShakeOffset += Vector3.new(0, -landImpulseShake, 0)
+			end
+		end
+		prevHumanoidState = state
+
+		local horizVel = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z)
+		local speed = horizVel.Magnitude
+		if speed > 0.5 and humanoid.FloorMaterial ~= Enum.Material.Air then
+			local isRunning = speed > 18
+			local freq = isRunning and CONFIG.RunBobFreq or CONFIG.WalkBobFreq
+			local amp = isRunning and runShakeAmp or walkShakeAmp
+			bobTimer += dt * freq
+			local bobX = math.cos(bobTimer * 0.5) * amp * 0.65
+			local bobY = math.abs(math.sin(bobTimer)) * amp
+			impulseShakeOffset += (right * bobX) + Vector3.new(0, bobY, 0) * 0.25
+		else
+			bobTimer = 0
+		end
+	end
+
+	impulseShakeOffset = impulseShakeOffset:Lerp(Vector3.zero, math.min(1, CONFIG.ShakeDecaySpeed * dt))
+
+	local pivot = root.Position + Vector3.new(0, pivotHeightOffset, 0)
+	local shoulderAnchor = pivot + (right * shoulderX) + Vector3.new(0, shoulderY, 0)
+	local desiredCamPos = shoulderAnchor - (forward * currentDistance)
+
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	local filterList = {}
+	if player.Character then
+		table.insert(filterList, player.Character)
+	end
+	for _, inst in ipairs(guiInstances) do
+		table.insert(filterList, inst)
+	end
+	rayParams.FilterDescendantsInstances = filterList
+
+	local camOffsetFromAnchor = desiredCamPos - shoulderAnchor
+	if camOffsetFromAnchor.Magnitude > 0.05 then
+		local hit = workspace:Raycast(shoulderAnchor, camOffsetFromAnchor, rayParams)
+		if hit then
+			desiredCamPos = hit.Position + (hit.Normal * 0.35)
+		end
+	end
+
+	currentCamPos = currentCamPos:Lerp(desiredCamPos, math.min(1, cameraLerpSpeed * dt))
+
+	local aimTarget = shoulderAnchor + (forward * lookAheadDistance)
+	local finalPos = currentCamPos + impulseShakeOffset
+	camera.CFrame = CFrame.lookAt(finalPos, aimTarget)
+end
+
+local function stopScript()
+	if destroyed then return end
+	destroyed = true
+
+	pcall(function()
+		RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
+	end)
+
+	for _, conn in ipairs(connections) do
+		pcall(function()
+			conn:Disconnect()
+		end)
+	end
+	table.clear(connections)
+
+	for _, inst in ipairs(guiInstances) do
+		pcall(function()
+			inst:Destroy()
+		end)
+	end
+	table.clear(guiInstances)
+
+	local hum = getHumanoid()
+	if hum then
+		hum.AutoRotate = true
+		hum.WalkSpeed = 16
+		hum.JumpPower = 50
+		camera.CameraSubject = hum
+	end
+	camera.CameraType = Enum.CameraType.Custom
+	if not UserInputService.TouchEnabled then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	end
+end
+
+rootEnv[REGISTRY_KEY] = {
+	stop = stopScript,
+}
+
+createGui()
+
+local humInit = getHumanoid()
+if humInit then
+	prevHumanoidState = humInit:GetState()
+end
+if cameraEnabled then
+	camera.CameraType = Enum.CameraType.Scriptable
+	currentCamPos = camera.CFrame.Position
+	if not UserInputService.TouchEnabled then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+	end
+end
+
+-- Input Handling
+local activeTouches: { [InputObject]: Vector2 } = {}
+
+trackConn(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if destroyed then return end
+
+	if input.KeyCode == CONFIG.FreecamKey and not gameProcessed then
+		if not cameraEnabled then
+			setCameraEnabled(true)
+		end
+		setFreecam(not isFreecam)
+		return
+	end
+
+	if input.UserInputType == Enum.UserInputType.Touch then
+		local pos = Vector2.new(input.Position.X, input.Position.Y)
+		if isPointInsideGui(pos) then
+			return
+		end
+		activeTouches[input] = pos
+	end
+end))
+
+trackConn(UserInputService.InputChanged:Connect(function(input, gameProcessed)
+	if destroyed or not cameraEnabled then return end
+
+	if isDraggingGui and panelFrame then
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			local cur = Vector2.new(input.Position.X, input.Position.Y)
+			local delta = cur - dragStartMousePos
+			panelFrame.Position = UDim2.new(
+				dragStartPanelPos.X.Scale,
+				dragStartPanelPos.X.Offset + delta.X,
+				dragStartPanelPos.Y.Scale,
+				dragStartPanelPos.Y.Offset + delta.Y
+			)
+			return
+		end
+	end
+
+	if activeSliderId then
+		return
+	end
+
+	if input.UserInputType == Enum.UserInputType.MouseMovement then
+		if not UserInputService.TouchEnabled then
+			yaw -= input.Delta.X * mouseSensitivity
+			pitch = math.clamp(pitch - input.Delta.Y * mouseSensitivity, CONFIG.MinPitch, CONFIG.MaxPitch)
+		end
+	elseif input.UserInputType == Enum.UserInputType.MouseWheel then
+		if not gameProcessed then
+			targetDistance = math.clamp(targetDistance - input.Position.Z * CONFIG.ZoomStep, CONFIG.MinDistance, CONFIG.MaxDistance)
+		end
+	elseif input.UserInputType == Enum.UserInputType.Touch then
+		local pos = Vector2.new(input.Position.X, input.Position.Y)
+		if activeTouches[input] then
+			local prevPos = activeTouches[input]
+			activeTouches[input] = pos
+
+			local viewportX = camera.ViewportSize.X
+			if prevPos.X >= viewportX * CONFIG.OrbitMinScreenXRatio then
+				local delta = pos - prevPos
+				yaw -= delta.X * touchSensitivity
+				pitch = math.clamp(pitch - delta.Y * touchSensitivity, CONFIG.MinPitch, CONFIG.MaxPitch)
+			end
+		end
+	end
+end))
+
+trackConn(UserInputService.InputEnded:Connect(function(input)
+	if destroyed then return end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		isDraggingGui = false
+	end
+	if input.UserInputType == Enum.UserInputType.Touch then
+		activeTouches[input] = nil
+	end
+end))
+
+trackConn(player.CharacterAdded:Connect(function(char)
+	if destroyed then return end
+	task.wait(0.1)
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if hum and cameraEnabled and not isFreecam then
+		hum.AutoRotate = true
+		prevHumanoidState = hum:GetState()
+	end
+end))
+
+RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value + 1, updateCamera)
